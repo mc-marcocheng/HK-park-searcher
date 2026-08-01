@@ -1,0 +1,73 @@
+name: Keep Upstash Redis alive
+
+# Upstash deletes free-tier databases that receive no requests for a while.
+# This workflow issues a couple of cheap commands on a schedule so the
+# database always looks active, even during quiet contribution periods.
+
+on:
+  schedule:
+    # Weekly (Mondays 03:17 UTC). Scheduled runs can be delayed or skipped when
+    # GitHub is busy, so a weekly ping gives ~4 chances per month to succeed.
+    # For a strictly monthly ping use: "17 3 1 * *"
+    - cron: "17 3 * * 1"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstash-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping Upstash Redis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Write and read a keepalive key
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UPSTASH_REDIS_REST_URL:-}" ] || [ -z "${UPSTASH_REDIS_REST_TOKEN:-}" ]; then
+            echo "::error::UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN secrets must be configured."
+            exit 1
+          fi
+
+          base="${UPSTASH_REDIS_REST_URL%/}"
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Never echo the URL or token; only responses are printed.
+          call() {
+            curl --silent --show-error --fail-with-body \
+              --retry 5 --retry-delay 10 --retry-all-errors \
+              --max-time 30 \
+              -X POST "$base" \
+              -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$1"
+          }
+
+          echo "Writing keepalive key..."
+          # 90-day TTL: the key self-cleans if this workflow is ever removed.
+          set_response="$(call "[\"SET\",\"keepalive:github-actions\",\"${stamp}\",\"EX\",\"7776000\"]")"
+          echo "SET -> ${set_response}"
+
+          echo "Reading keepalive key..."
+          get_response="$(call '["GET","keepalive:github-actions"]')"
+          echo "GET -> ${get_response}"
+
+          case "$get_response" in
+            *"$stamp"*)
+              echo "Upstash Redis responded correctly."
+              echo "Upstash keepalive succeeded at \`${stamp}\`." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Unexpected response from Upstash Redis; the database may be missing or the token invalid."
+              exit 1
+              ;;
+          esac
